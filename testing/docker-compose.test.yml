@@ -1,0 +1,150 @@
+version: '3.8'
+
+services:
+  # Test Database (isolated from main DB)
+  test-postgres:
+    image: postgres:14-alpine
+    ports:
+      - "5434:5432"
+    environment:
+      - POSTGRES_USER=test_user
+      - POSTGRES_PASSWORD=test_password
+      - POSTGRES_DB=test_medusa_db
+    volumes:
+      - test-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test_user -d test_medusa_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test-network
+
+  # Test Redis
+  test-redis:
+    image: redis:6.2-alpine
+    ports:
+      - "6380:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - test-network
+
+  # Test Medusa Backend
+  test-medusa:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+      args:
+        NODE_ENV: test
+    ports:
+      - "9001:9000"
+    environment:
+      - NODE_ENV=test
+      - DATABASE_URL=postgres://test_user:test_password@test-postgres:5432/test_medusa_db?sslmode=disable
+      - REDIS_URL=redis://test-redis:6379
+      - JWT_SECRET=test_jwt_secret_very_secure_123
+      - COOKIE_SECRET=test_cookie_secret_very_secure_123
+      - STORE_CORS=http://localhost:3001
+      - ADMIN_CORS=http://localhost:7001,http://localhost:9001
+      - AUTH_CORS=http://localhost:3001,http://localhost:7001
+      - STRIPE_API_KEY=${TEST_STRIPE_API_KEY:-sk_test_dummy}
+      - STRIPE_WEBHOOK_SECRET=${TEST_STRIPE_WEBHOOK_SECRET:-whsec_test_dummy}
+      - SUPABASE_URL=${TEST_SUPABASE_URL}
+      - SUPABASE_KEY=${TEST_SUPABASE_KEY}
+      - SUPABASE_BUCKET=${TEST_SUPABASE_BUCKET:-test-bucket}
+      # Performance tuning
+      - NODE_OPTIONS=--max-old-space-size=2048
+      - MEDUSA_WORKER_MODE=server
+    volumes:
+      - ../backend:/app/
+      - /app/node_modules
+    depends_on:
+      test-postgres:
+        condition: service_healthy
+      test-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - test-network
+
+  # Test Frontend
+  test-frontend:
+    build:
+      context: ../
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3000"
+    environment:
+      - NEXT_PUBLIC_MEDUSA_BACKEND_URL=http://test-medusa:9000
+      - NODE_ENV=test
+    depends_on:
+      test-medusa:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - test-network
+
+  # Load Testing Container
+  load-tester:
+    image: grafana/k6:latest
+    volumes:
+      - ./load-tests:/scripts
+    networks:
+      - test-network
+    profiles:
+      - load-test
+
+  # Monitoring Stack
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - test-network
+    profiles:
+      - monitoring
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3002:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    networks:
+      - test-network
+    profiles:
+      - monitoring
+
+volumes:
+  test-db-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  test-network:
+    driver: bridge

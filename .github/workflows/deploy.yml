@@ -1,0 +1,184 @@
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  # Test job runs first
+  test:
+    name: Test Application
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8.15.0
+          
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+        
+      - name: Run frontend linting
+        run: pnpm lint
+        
+      - name: Build frontend
+        run: pnpm build
+        env:
+          NEXT_PUBLIC_MEDUSA_BACKEND_URL: ${{ secrets.MEDUSA_BACKEND_URL }}
+          
+      - name: Install backend dependencies
+        working-directory: ./backend
+        run: yarn install --frozen-lockfile
+        
+      - name: Run backend tests
+        working-directory: ./backend
+        run: yarn test:unit
+
+  # Deploy Frontend to Vercel
+  deploy-frontend:
+    name: Deploy Frontend
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to Vercel
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
+          scope: ${{ secrets.VERCEL_ORG_ID }}
+
+  # Deploy Backend (Railway)
+  deploy-backend-railway:
+    name: Deploy Backend to Railway
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli
+        
+      - name: Deploy to Railway
+        run: |
+          cd backend
+          railway up --service backend
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+
+  # Alternative: Deploy Backend (Render)
+  deploy-backend-render:
+    name: Deploy Backend to Render
+    needs: test
+    runs-on: ubuntu-latest
+    if: false # Enable by changing to `if: github.ref == 'refs/heads/main'`
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Deploy to Render
+        uses: johnbeynon/render-deploy-action@v0.0.8
+        with:
+          service-id: ${{ secrets.RENDER_SERVICE_ID }}
+          api-key: ${{ secrets.RENDER_API_KEY }}
+
+  # Database Migration
+  migrate-database:
+    name: Run Database Migrations
+    needs: [deploy-backend-railway]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Install dependencies
+        working-directory: ./backend
+        run: yarn install --frozen-lockfile
+        
+      - name: Run migrations
+        working-directory: ./backend
+        run: yarn medusa migrations run
+        env:
+          DATABASE_URL: ${{ secrets.PRODUCTION_DATABASE_URL }}
+
+  # Health Check
+  health-check:
+    name: Production Health Check
+    needs: [deploy-frontend, deploy-backend-railway, migrate-database]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Check Frontend Health
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.FRONTEND_URL }})
+          if [ $response -eq 200 ]; then
+            echo "Frontend is healthy"
+          else
+            echo "Frontend health check failed with status: $response"
+            exit 1
+          fi
+          
+      - name: Check Backend Health
+        run: |
+          response=$(curl -s -o /dev/null -w "%{http_code}" ${{ secrets.BACKEND_URL }}/health)
+          if [ $response -eq 200 ]; then
+            echo "Backend is healthy"
+          else
+            echo "Backend health check failed with status: $response"
+            exit 1
+          fi
+          
+      - name: Send Deployment Notification
+        if: success()
+        uses: 8398a7/action-slack@v3
+        with:
+          status: success
+          text: 'Production deployment completed successfully!'
+          webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        continue-on-error: true
+
+  # Rollback on Failure
+  rollback:
+    name: Rollback Deployment
+    needs: health-check
+    runs-on: ubuntu-latest
+    if: failure()
+    
+    steps:
+      - name: Trigger Rollback
+        run: |
+          echo "Deployment failed, triggering rollback..."
+          # Add rollback logic here (e.g., Railway/Render CLI commands)

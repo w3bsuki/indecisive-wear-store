@@ -1,0 +1,11 @@
+node_modules
+.git
+*.log
+.medusa
+yarn.lock
+package.json.backup
+.env*
+!.env.production
+pnpm-lock.yaml
+integration-tests
+.vscode
